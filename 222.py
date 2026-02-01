@@ -1,265 +1,566 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-区块链极简钱包 -coin版
-地址格式：coinxxxxxxxxxxxxxxxx（20位固定：coin+16位字符）
-核心功能：查询余额 | 发送交易 | 查询区块高度
+Coin Wallet - XODE 轻量级钱包客户端
+功能：
+  1. 自动向主节点注册并维持心跳（参与区块奖励分配）
+  2. 本地安全存储私钥，支持离线复活
+  3. 内置 Web 界面，浏览器即可完成转账、查询
+  4. 自动同步主节点手续费
 """
 import hashlib
 import json
 import requests
-import socket
+import argparse
 import threading
 import time
 import os
 from time import time as now
+from flask import Flask, request, jsonify, render_template_string
+from ecdsa import SigningKey, SECP256k1
 
-# -------------------------- 仅需配置这1行！填写你的公网节点地址 --------------------------
-MAIN_NODE_URL = "http://62.234.183.74:9753"  # 例：http://123.45.67.89:9753
-# ----------------------------------------------------------------------------------------
+# ---------------- 配置 ----------------
+MAIN_NODE = "62.234.183.74:9753"  # 主节点地址
+HEARTBEAT_INTERVAL = 75           # 心跳间隔（秒）
+KEY_FILE = "wallet_key.json"      # 本地密钥文件
 
-# 核心配置（无需修改）
-HEARTBEAT_INTERVAL = 30  # 后台自动心跳，保线用
-API_TIMEOUT = 5
-WALLET_FILE = "simple_wallet.json"  # 本地钱包文件，保存Coin地址
-COIN_ADDR_LEN = 20  # 钱包地址固定长度：coin+16位=20位
+# ---------------- HTML 模板（Coin Wallet 界面）----------------
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coin Wallet - XODE</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; 
+            background: linear-gradient(135deg, #1a2a6c 0%, #b21f1f 50%, #fdbb2d 100%); 
+            min-height: 100vh; color: #333; padding: 20px; 
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { text-align: center; color: white; margin-bottom: 30px; padding: 20px; }
+        .logo { font-size: 2.8em; font-weight: bold; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); margin-bottom: 10px; }
+        .subtitle { opacity: 0.95; font-size: 1em; letter-spacing: 1px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+        .card { 
+            background: rgba(255,255,255,0.95); border-radius: 20px; padding: 28px; 
+            box-shadow: 0 15px 35px rgba(0,0,0,0.2); backdrop-filter: blur(10px);
+            transition: transform 0.3s;
+        }
+        .card:hover { transform: translateY(-5px); box-shadow: 0 20px 40px rgba(0,0,0,0.3); }
+        .card-title { 
+            font-size: 0.9em; color: #555; text-transform: uppercase; letter-spacing: 2px; 
+            margin-bottom: 14px; display: flex; align-items: center; gap: 8px; font-weight: bold;
+        }
+        .balance-display { 
+            font-size: 3.2em; font-weight: bold; color: #1a2a6c; margin: 15px 0; 
+            font-family: 'Courier New', monospace; text-shadow: 1px 1px 2px rgba(0,0,0,0.1);
+        }
+        .address-box { 
+            background: #f0f4f8; padding: 14px; border-radius: 10px; font-family: monospace; 
+            font-size: 0.9em; word-break: break-all; display: flex; justify-content: space-between; 
+            align-items: center; gap: 10px; border: 2px solid #e1e8ed;
+        }
+        .btn { 
+            background: #1a2a6c; color: white; border: none; padding: 10px 20px; border-radius: 8px; 
+            cursor: pointer; font-size: 0.9em; transition: all 0.3s; font-weight: 600;
+        }
+        .btn:hover { background: #b21f1f; transform: scale(1.05); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
+        .form-group { margin-bottom: 18px; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; color: #444; font-size: 0.95em; }
+        input[type="text"], input[type="number"] { 
+            width: 100%; padding: 14px; border: 2px solid #ddd; border-radius: 10px; 
+            font-size: 1em; transition: all 0.3s; background: #fafafa;
+        }
+        input:focus { outline: none; border-color: #b21f1f; background: white; box-shadow: 0 0 0 3px rgba(178,31,31,0.1); }
+        .btn-submit { 
+            width: 100%; padding: 16px; background: linear-gradient(135deg, #1a2a6c 0%, #b21f1f 100%); 
+            color: white; border: none; border-radius: 10px; font-size: 1.2em; font-weight: bold; 
+            cursor: pointer; transition: all 0.3s; text-transform: uppercase; letter-spacing: 1px;
+        }
+        .btn-submit:hover { opacity: 0.95; transform: translateY(-2px); box-shadow: 0 10px 25px rgba(178,31,31,0.3); }
+        .btn-submit:disabled { background: #ccc; cursor: not-allowed; opacity: 0.6; transform: none; }
+        .tx-list { max-height: 500px; overflow-y: auto; }
+        .tx-item { 
+            padding: 14px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; 
+            align-items: center; transition: all 0.2s; border-radius: 8px; margin-bottom: 4px;
+        }
+        .tx-item:hover { background: #f8f9fa; transform: translateX(5px); }
+        .tx-item:last-child { border-bottom: none; }
+        .tx-type { padding: 5px 10px; border-radius: 20px; font-size: 0.75em; font-weight: bold; }
+        .tx-in { background: #d4edda; color: #155724; }
+        .tx-out { background: #f8d7da; color: #721c24; }
+        .tx-pending { background: #fff3cd; color: #856404; }
+        .tx-amount { font-weight: bold; font-family: monospace; font-size: 1.1em; }
+        .tx-amount.out { color: #dc3545; }
+        .tx-amount.in { color: #28a745; }
+        .status-bar { 
+            position: fixed; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.85); color: white; 
+            padding: 14px; display: flex; justify-content: space-between; align-items: center; 
+            font-size: 0.9em; backdrop-filter: blur(10px);
+        }
+        .status-indicator { display: flex; align-items: center; gap: 8px; }
+        .dot { width: 10px; height: 10px; border-radius: 50%; background: #28a745; animation: pulse 2s infinite; }
+        .dot.offline { background: #dc3545; animation: none; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .toast { 
+            position: fixed; top: 20px; right: 20px; background: white; padding: 20px; border-radius: 12px; 
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3); display: none; animation: slideIn 0.4s; z-index: 1000; max-width: 350px;
+        }
+        .toast.show { display: block; }
+        .toast.success { border-left: 5px solid #28a745; }
+        .toast.error { border-left: 5px solid #dc3545; }
+        @keyframes slideIn { from { transform: translateX(100%) scale(0.9); opacity: 0; } to { transform: translateX(0) scale(1); opacity: 1; } }
+        .loading { 
+            display: inline-block; width: 20px; height: 20px; border: 3px solid #f3f3f3; 
+            border-top: 3px solid #b21f1f; border-radius: 50%; animation: spin 1s linear infinite; 
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-top: 20px; }
+        .stat-box { text-align: center; padding: 15px; background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); border-radius: 12px; }
+        .stat-value { font-size: 1.6em; font-weight: bold; color: #1a2a6c; }
+        .stat-label { font-size: 0.8em; color: #666; margin-top: 6px; font-weight: 600; }
+        .wallet-tag { 
+            display: inline-block; background: rgba(26,42,108,0.1); color: #1a2a6c; padding: 4px 12px; 
+            border-radius: 20px; font-size: 0.8em; margin-left: 10px; font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">💰 Coin Wallet <span class="wallet-tag">XODE</span></div>
+            <div class="subtitle">去中心化轻钱包 | 自动分奖 | 本地私钥保护</div>
+        </header>
+        <div class="grid">
+            <div class="left-panel">
+                <div class="card">
+                    <div class="card-title">💎 我的资产</div>
+                    <div class="balance-display" id="balance">--</div>
+                    <div class="address-box">
+                        <span id="address">加载中...</span>
+                        <button class="btn" onclick="copyAddress()">📋 复制</button>
+                    </div>
+                    <div class="stats-grid">
+                        <div class="stat-box"><div class="stat-value" id="txCount">--</div><div class="stat-label">交易数</div></div>
+                        <div class="stat-box"><div class="stat-value" id="nodeCount">--</div><div class="stat-label">在线节点</div></div>
+                        <div class="stat-box"><div class="stat-value" id="blockHeight">--</div><div class="stat-label">区块高度</div></div>
+                    </div>
+                </div>
+                <div class="card" style="margin-top: 20px;">
+                    <div class="card-title">🚀 转账汇款</div>
+                    <form id="sendForm" onsubmit="sendTransaction(event)">
+                        <div class="form-group">
+                            <label>接收地址 (coin开头)</label>
+                            <input type="text" id="recipient" placeholder="coin..." required>
+                        </div>
+                        <div class="form-group">
+                            <label>转账金额 (XODE)</label>
+                            <input type="number" id="amount" step="0.000001" min="0.000001" placeholder="0.00" required>
+                        </div>
+                        <div class="form-group">
+                            <label>网络手续费 (默认 2.0)</label>
+                            <input type="number" id="fee" step="0.1" min="0.1" value="2.0">
+                        </div>
+                        <button type="submit" class="btn-submit" id="sendBtn">✈️ 确认转账</button>
+                    </form>
+                </div>
+            </div>
+            <div class="right-panel">
+                <div class="card" style="height: 100%; min-height: 500px;">
+                    <div class="card-title" style="display: flex; justify-content: space-between;">
+                        <span>📜 交易明细</span>
+                        <button class="btn btn-secondary" onclick="refreshData()">🔄 刷新</button>
+                    </div>
+                    <div id="txList" class="tx-list"><div style="text-align: center; padding: 40px; color: #999;">加载中...</div></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="status-bar">
+        <div class="status-indicator"><div class="dot" id="statusDot"></div><span id="statusText">正在连接网络...</span></div>
+        <div>主节点: {{ main_node }} | 钱包服务: 127.0.0.1:{{ port }}</div>
+    </div>
+    <div id="toast" class="toast">
+        <div id="toastTitle" style="font-weight: bold; margin-bottom: 6px; font-size: 1.1em;"></div>
+        <div id="toastMessage" style="font-size: 0.95em; color: #555;"></div>
+    </div>
+    <script>
+        let myAddress = '';
+        let refreshInterval;
+        window.onload = function() { initData(); refreshInterval = setInterval(refreshData, 30000); };
+        function showToast(title, message, type = 'success') {
+            const toast = document.getElementById('toast');
+            document.getElementById('toastTitle').textContent = title;
+            document.getElementById('toastMessage').textContent = message;
+            toast.className = 'toast show ' + type;
+            setTimeout(() => { toast.classList.remove('show'); }, 4000);
+        }
+        async function initData() {
+            try {
+                const status = await fetch('/api/status').then(r => r.json());
+                if (status.code === 200) {
+                    myAddress = status.coin_addr;
+                    document.getElementById('address').textContent = myAddress;
+                    updateStatus(true);
+                }
+                await refreshData();
+            } catch (e) { showToast('连接失败', '无法连接到 Coin Wallet 服务', 'error'); updateStatus(false); }
+        }
+        async function refreshData() {
+            try {
+                const [balanceRes, historyRes, chainRes] = await Promise.all([
+                    fetch('/api/balance').then(r => r.json()),
+                    fetch('/api/history').then(r => r.json()),
+                    fetch('/api/chain/stats').then(r => r.json())
+                ]);
+                if (balanceRes.code === 200) document.getElementById('balance').textContent = parseFloat(balanceRes.balance).toFixed(6);
+                if (chainRes.code === 200) {
+                    document.getElementById('nodeCount').textContent = chainRes.stats.total_online_nodes;
+                    document.getElementById('blockHeight').textContent = chainRes.stats.latest_block_height;
+                }
+                if (historyRes.code === 200) {
+                    renderTxList(historyRes.transactions || []);
+                    document.getElementById('txCount').textContent = historyRes.total_transactions || 0;
+                }
+                updateStatus(true);
+            } catch (e) { console.error('刷新失败:', e); updateStatus(false); }
+        }
+        function renderTxList(transactions) {
+            const list = document.getElementById('txList');
+            if (!transactions || transactions.length === 0) { list.innerHTML = '<div style="text-align: center; padding: 40px; color: #999;"><p>暂无交易记录</p><p style="font-size: 0.9em; margin-top: 10px;">转账后将在此显示</p></div>'; return; }
+            list.innerHTML = transactions.map(tx => {
+                const isOut = tx.type === 'outgoing', isPending = tx.status === 'pending';
+                const typeClass = isPending ? 'tx-pending' : (isOut ? 'tx-out' : 'tx-in');
+                const typeText = isPending ? '确认中' : (isOut ? '转出' : '转入');
+                const amountClass = isOut ? 'out' : 'in';
+                const sign = isOut ? '-' : '+';
+                const counterparty = isOut ? '→ ' + tx.counterparty.substring(0, 14) + '...' : '← ' + tx.counterparty.substring(0, 14) + '...';
+                return `<div class="tx-item"><div><span class="tx-type ${typeClass}">${typeText}</span><div style="margin-top: 6px; font-size: 0.9em; color: #555; font-weight: 500;">${counterparty}</div><div style="font-size: 0.8em; color: #999; margin-top: 4px;">${new Date(tx.timestamp * 1000).toLocaleString()}</div></div><div class="tx-amount ${amountClass}">${sign}${parseFloat(tx.amount).toFixed(2)}</div></div>`;
+            }).join('');
+        }
+        async function sendTransaction(e) {
+            e.preventDefault();
+            const btn = document.getElementById('sendBtn'), originalText = btn.textContent;
+            const recipient = document.getElementById('recipient').value, amount = parseFloat(document.getElementById('amount').value), fee = parseFloat(document.getElementById('fee').value);
+            if (!recipient.startsWith('coin') || recipient.length !== 20) { showToast('地址格式错误', '请输入有效的 coin 开头地址', 'error'); return; }
+            if (amount <= 0) { showToast('金额错误', '转账金额必须大于 0', 'error'); return; }
+            if (fee < 0.1) { showToast('手续费过低', '手续费至少 0.1 XODE', 'error'); return; }
+            btn.disabled = true; btn.innerHTML = '<div class="loading" style="width: 18px; height: 18px; border-width: 2px; margin-right: 8px;"></div> 处理中...';
+            try {
+                const res = await fetch('/api/send', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({recipient, amount, fee}) }).then(r => r.json());
+                if (res.code === 201) { showToast('转账成功！', `交易ID: ${res.txid.substring(0, 16)}...`, 'success'); document.getElementById('sendForm').reset(); setTimeout(refreshData, 1500); }
+                else { showToast('转账失败', res.error || '请检查余额或网络', 'error'); }
+            } catch (e) { showToast('网络错误', '无法连接到钱包服务', 'error'); }
+            finally { btn.disabled = false; btn.innerHTML = originalText; }
+        }
+        function copyAddress() { navigator.clipboard.writeText(myAddress).then(() => { showToast('已复制', '钱包地址已复制到剪贴板'); }); }
+        function updateStatus(online) {
+            const dot = document.getElementById('statusDot'), text = document.getElementById('statusText');
+            if (online) { dot.classList.remove('offline'); text.textContent = '已连接 | 在线挖矿中'; }
+            else { dot.classList.add('offline'); text.textContent = '离线 | 检查网络连接'; }
+        }
+    </script>
+</body>
+</html>
+"""
 
-# 全局状态
-wallet_address = ""  # Coin地址（coinxxxxxxxxxxxxxxxx）
-real_address = ""    # 设备真实地址
-is_connected = False # 是否连接主节点
+# ---------------- 加密/工具函数 ----------------
+def gen_keypair():
+    sk = SigningKey.generate(curve=SECP256k1)
+    pk_bytes = sk.get_verifying_key().to_string()
+    pk_hash = hashlib.sha256(pk_bytes).hexdigest()[:16]
+    addr = f'coin{pk_hash}'
+    return sk.to_string().hex(), addr, pk_bytes
 
-# ---------------- 核心工具：生成Coin地址（和公网节点完全一致）----------------
-def gen_fixed_addr(real_addr: str) -> str:
-    """生成Coin地址：coin + 16位字母数字（和公网节点算法一致）"""
-    h = hashlib.sha256(real_addr.encode()).hexdigest()
-    short_part = ''.join([c for c in h if c.isalnum()])[:16]
-    return f"coin{short_part}"  # 去掉下划线，直接拼接
+def sign(sk_hex: str, payload: bytes) -> str:
+    sk = SigningKey.from_string(bytes.fromhex(sk_hex), curve=SECP256k1)
+    return sk.sign(payload).hex()
 
-def get_local_real_address():
-    """自动获取设备真实网络地址（适配内网/公网，随机端口防占用）"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        random_port = 9000 + int(time.time() % 1000)
-        return f"{local_ip}:{random_port}"
-    except:
-        return f"127.0.0.1:{9000 + int(time.time() % 1000)}"
+def tx_payload(sender: str, recipient: str, amount: float, nonce: int, fee: float) -> bytes:
+    core_data = dict(sender=sender, recipient=recipient, amount=amount, nonce=nonce, fee=fee)
+    core_payload = json.dumps(core_data, sort_keys=True, separators=(',', ':')).encode()
+    core_txid = hashlib.sha256(core_payload).hexdigest()[:16]
+    sign_data = dict(core_txid=core_txid, **core_data)
+    return json.dumps(sign_data, sort_keys=True, separators=(',', ':')).encode()
 
-def save_wallet():
-    """保存Coin地址到本地，重启自动加载"""
-    wallet_info = {
-        "wallet_address": wallet_address,
-        "real_address": real_address,
-        "create_time": now()
-    }
-    with open(WALLET_FILE, 'w', encoding='utf-8') as f:
-        json.dump(wallet_info, f, ensure_ascii=False, indent=2)
-
-def load_wallet():
-    """从本地加载Coin地址，无则新建"""
-    global wallet_address, real_address
-    if os.path.exists(WALLET_FILE):
+# ---------------- Coin Wallet 核心类 ----------------
+class CoinWallet:
+    def __init__(self):
+        self.sk_hex = None
+        self.coin_addr = None
+        self.pk_bytes = None
+        self.last_nonce = -1
+        self.tx_fee = 2.0
+        self.load_or_create_key()
+        self.running = True
+        
+    def load_or_create_key(self):
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, 'r', encoding='utf-8') as f:
+                dat = json.load(f)
+            self.sk_hex = dat['sk_hex']
+            self.coin_addr = dat['coin_addr']
+            self.pk_bytes = bytes.fromhex(dat['pubkey_hex'])
+            self.last_nonce = dat.get('last_nonce', -1)
+            print(f"✅ Coin Wallet 已加载 | 地址: {self.coin_addr}")
+        else:
+            self.sk_hex, self.coin_addr, self.pk_bytes = gen_keypair()
+            self.save_key()
+            print(f"🆕 Coin Wallet 新创建 | 地址: {self.coin_addr}")
+    
+    def save_key(self):
+        with open(KEY_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                'sk_hex': self.sk_hex,
+                'coin_addr': self.coin_addr,
+                'pubkey_hex': self.pk_bytes.hex(),
+                'last_nonce': self.last_nonce
+            }, f, indent=2)
+    
+    def get_network_fee(self):
         try:
-            with open(WALLET_FILE, 'r', encoding='utf-8') as f:
-                info = json.load(f)
-            wallet_address = info["wallet_address"]
-            real_address = info["real_address"]
-            # 校验地址格式（20位）
-            if not (wallet_address.startswith("coin") and len(wallet_address)==COIN_ADDR_LEN):
-                raise Exception("地址格式错误")
-            print(f"✅ 加载本地钱包成功 | 你的Coin地址：{wallet_address}")
-            return True
+            resp = requests.get(f"http://{MAIN_NODE}/chain/stats", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == 200:
+                    return data.get('stats', {}).get('tx_fee', 2.0)
         except:
-            os.remove(WALLET_FILE)
-            print("⚠️  本地钱包文件损坏，将创建新钱包")
-    # 新建钱包
-    real_address = get_local_real_address()
-    wallet_address = gen_fixed_addr(real_address)
-    save_wallet()
-    print(f"🆕 新建钱包成功 | 你的Coin地址：{wallet_address}（固定20位，请勿泄露）")
-    return False
-
-def auto_heartbeat():
-    """后台自动心跳保线，断连自动重试，不影响前台操作"""
-    global is_connected
-    while True:
+            pass
+        return 2.0
+    
+    def heartbeat_loop(self):
+        self.tx_fee = self.get_network_fee()
+        print(f"💰 当前网络手续费: {self.tx_fee} XODE")
+        
+        while self.running:
+            try:
+                self.register()
+                if int(now()) % 300 == 0:
+                    new_fee = self.get_network_fee()
+                    if new_fee != self.tx_fee:
+                        print(f"💰 手续费更新: {self.tx_fee} → {new_fee}")
+                        self.tx_fee = new_fee
+                for _ in range(HEARTBEAT_INTERVAL):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+            except Exception as e:
+                print(f"⚠️ 心跳异常: {e}")
+                time.sleep(10)
+    
+    def get_public_ip(self):
         try:
-            res = requests.post(
-                f"{MAIN_NODE_URL}/heartbeat",
-                json={"real_address": real_address},
+            services = ['https://api.ipify.org', 'https://ipinfo.io/ip', 'https://icanhazip.com']
+            for svc in services:
+                try:
+                    ip = requests.get(svc, timeout=5).text.strip()
+                    if ip and ip != '127.0.0.1':
+                        return ip
+                except:
+                    continue
+            return '127.0.0.1'
+        except:
+            return '127.0.0.1'
+    
+    def register(self):
+        try:
+            ip = self.get_public_ip()
+            real_address = f"{ip}:0"
+            
+            resp = requests.post(
+                f"http://{MAIN_NODE}/heartbeat",
+                json={
+                    "real_address": real_address,
+                    "coin_addr": self.coin_addr,
+                    "pubkey_hex": self.pk_bytes.hex()
+                },
                 headers={"Content-Type": "application/json"},
-                timeout=API_TIMEOUT
+                timeout=10
             )
-            is_connected = res.json().get('code') == 200
-        except:
-            is_connected = False
-            time.sleep(10)
-            continue
-        time.sleep(HEARTBEAT_INTERVAL)
-
-def check_main_node():
-    """启动前验证主节点是否可达"""
-    try:
-        requests.get(f"{MAIN_NODE_URL}/nodes/info", timeout=API_TIMEOUT)
-        return True
-    except:
-        print(f"❌ 主节点连接失败！请检查：")
-        print(f"  1. MAIN_NODE_URL 是否填对（例：http://123.45.67.89:9753）")
-        print(f"  2. 云服务器9753端口是否开放")
-        print(f"  3. 公网节点是否已启动")
-        input("按回车键退出...")
-        os._exit(1)
-
-# -------------------------- 三大核心功能（Coin地址适配）--------------------------
-def query_balance():
-    """功能1：查询自身Coin地址余额"""
-    if not is_connected:
-        print("❌ 钱包未连接主节点，正在重试...")
-        time.sleep(2)
-        if not is_connected:
-            print("❌ 连接失败，请检查网络后重启钱包！")
-            return
-    try:
-        res = requests.get(f"{MAIN_NODE_URL}/balance/{wallet_address}", timeout=API_TIMEOUT)
-        if res.json().get('code') == 200:
-            balance = round(res.json()["balance"], 6)
-            print(f"\n💰 你的Coin地址：{wallet_address}")
-            print(f"💰 当前钱包余额：{balance}")
-        else:
-            print(f"❌ 查询失败：{res.json().get('error', '未知错误')}")
-    except Exception as e:
-        print(f"❌ 查询失败：{str(e)[:30]}")
-
-def send_transaction():
-    """功能2：发送交易（向其他Coin地址转币），带严格格式校验"""
-    if not is_connected:
-        print("❌ 钱包未连接主节点，无法发送交易！")
-        return
-    print("\n📤 发送交易（仅支持Coin地址，格式：coinxxxxxxxxxxxxxxxx，20位）")
-    try:
-        # 输入收款地址（严格校验20位coin开头）
-        to_addr = input("请输入收款Coin地址：").strip()
-        if not (to_addr.startswith("coin") and len(to_addr)==COIN_ADDR_LEN):
-            print(f"❌ 收款地址格式错误！必须是20位，以coin开头的地址（例：coin1234567890abcdef）")
-            return
-        if to_addr == wallet_address:
-            print("❌ 不能向自身地址转币！")
-            return
-        # 输入转账金额
-        amount = input("请输入转账金额（正数，例：10.5）：").strip()
-        amount = float(amount)
-        if amount <= 0:
-            print("❌ 转账金额必须大于0！")
-            return
-        # 发送交易（直接用Coin地址）
-        res = requests.post(
-            f"{MAIN_NODE_URL}/transactions/new",
-            json={"sender": wallet_address, "recipient": to_addr, "amount": amount},
-            headers={"Content-Type": "application/json"},
-            timeout=API_TIMEOUT
-        )
-        if res.json().get('code') == 201:
-            block_index = res.json()["tx"]["pending_block"]
-            print(f"✅ 交易提交成功！")
-            print(f"✅ 待第{block_index}个区块确认后到账（约{int(MAIN_NODE_URL.split(':')[-1].split('/')[-1]) or 120}秒）")
-        else:
-            print(f"❌ 交易失败：{res.json().get('error', '余额不足/地址错误')}")
-    except ValueError:
-        print("❌ 金额格式错误！请输入数字（例：10.5，支持小数）")
-    except KeyboardInterrupt:
-        print("\n✅ 已取消发送交易，返回菜单")
-    except Exception as e:
-        print(f"❌ 交易失败：{str(e)[:30]}")
-
-def query_block_height():
-    """功能3：查询全网最新区块高度+在线节点数"""
-    if not is_connected:
-        print("❌ 钱包未连接主节点，正在重试...")
-        time.sleep(2)
-        if not is_connected:
-            print("❌ 连接失败，请检查网络后重启钱包！")
-            return
-    try:
-        res = requests.get(f"{MAIN_NODE_URL}/nodes/info", timeout=API_TIMEOUT)
-        if res.json().get('code') == 200:
-            height = res.json()["total_block"]
-            online_count = res.json()["online_node"]
-            main_coin = res.json()["main_node_coin_addr"]
-            print(f"\n📊 全网最新区块高度：{height}")
-            print(f"📊 全网在线节点数：{online_count}台")
-            print(f"⛏️  出块主节点Coin：{main_coin[-10:]}（后10位）")
-        else:
-            print(f"❌ 查询失败：{res.json().get('error', '未知错误')}")
-    except Exception as e:
-        print(f"❌ 查询失败：{str(e)[:30]}")
-
-# -------------------------- 中文交互式主菜单 --------------------------
-def main_menu():
-    """中文交互式主菜单，按数字选择功能"""
-    while True:
-        print("\n" + "="*60)
-        print("          🚀 区块链极简钱包 - Coin地址版")
-        print("="*60)
-        print(f"          🔑 你的钱包地址：{wallet_address[-10:]}（后10位）")
-        print("="*60)
-        print("            1 → 查询我的钱包余额（精准到6位小数）")
-        print("            2 → 发送交易（转币给其他Coin地址）")
-        print("            3 → 查询全网区块高度+在线节点数")
-        print("            0 → 安全退出钱包")
-        print("="*60)
-        try:
-            choice = input("请输入数字选择功能（0-3）：").strip()
-            if choice == "1":
-                query_balance()
-            elif choice == "2":
-                send_transaction()
-            elif choice == "3":
-                query_block_height()
-            elif choice == "0":
-                print("\n👋 钱包已安全退出，下次启动自动加载地址！")
-                os._exit(0)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                server_addr = data.get('coin_addr')
+                if server_addr != self.coin_addr:
+                    print(f"❌ 地址不一致！本地：{self.coin_addr}，服务端：{server_addr}")
+                    return False
+                return True
+            elif resp.status_code == 429:
+                return True
             else:
-                print("❌ 输入错误！请输入0、1、2、3中的一个数字")
-        except KeyboardInterrupt:
-            print("\n👋 钱包已安全退出，下次启动自动加载地址！")
-            os._exit(0)
+                return False
+        except:
+            return False
+    
+    def get_balance(self):
+        try:
+            resp = requests.get(f"http://{MAIN_NODE}/balance/{self.coin_addr}", timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get('balance', 0)
+            return 0
+        except:
+            return 0
+    
+    def get_history(self):
+        try:
+            resp = requests.get(f"http://{MAIN_NODE}/address/transactions?addr={self.coin_addr}&size=50", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == 200:
+                    return data.get('data', {})
+            return {'transactions': [], 'total': 0}
+        except:
+            return {'transactions': [], 'total': 0}
+    
+    def send(self, recipient, amount, fee=None):
+        try:
+            amount = round(float(amount), 6)
+            tx_fee = round(float(fee), 6) if fee is not None else self.tx_fee
+            
+            balance = self.get_balance()
+            if balance < amount + tx_fee:
+                return {"error": f"余额不足（当前：{balance}，需要：{round(amount + tx_fee, 6)}）"}
+            
+            self.last_nonce += 1
+            nonce = self.last_nonce
+            
+            payload = tx_payload(self.coin_addr, recipient, amount, nonce, tx_fee)
+            signature = sign(self.sk_hex, payload)
+            
+            tx_data = {
+                "sender": self.coin_addr,
+                "recipient": recipient,
+                "amount": amount,
+                "nonce": nonce,
+                "signature": signature
+            }
+            
+            resp = requests.post(
+                f"http://{MAIN_NODE}/transactions/new",
+                json=tx_data,
+                headers={"Content-Type": "application/json"},
+                timeout=10
+            )
+            
+            result = resp.json()
+            
+            if resp.status_code == 201:
+                self.save_key()
+                return {"success": True, "txid": result.get('txid'), "pending_block": result.get('pending_block'), "nonce": nonce, "fee": tx_fee, "amount": amount}
+            else:
+                self.last_nonce -= 1
+                return {"error": result.get('error', '发送失败')}
         except Exception as e:
-            print(f"❌ 操作异常：{str(e)[:30]}，请重新选择")
-        # 操作后暂停，让用户看清结果
-        input("\n按回车键返回主菜单...")
+            self.last_nonce -= 1
+            return {"error": str(e)}
 
+# ---------------- Flask API ----------------
+app = Flask(__name__)
+wallet = None
+local_port = 8080
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE, main_node=MAIN_NODE, port=local_port)
+
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify({"code": 200, "coin_addr": wallet.coin_addr, "status": "active", "main_node": MAIN_NODE, "tx_fee": wallet.tx_fee})
+
+@app.route('/api/balance', methods=['GET'])
+def api_balance():
+    balance = wallet.get_balance()
+    return jsonify({"code": 200, "balance": balance, "coin_addr": wallet.coin_addr})
+
+@app.route('/api/history', methods=['GET'])
+def api_history():
+    data = wallet.get_history()
+    return jsonify({"code": 200, "transactions": data.get('transactions', []), "total_transactions": data.get('total', 0)})
+
+@app.route('/api/send', methods=['POST'])
+def api_send():
+    data = request.json or {}
+    recipient = data.get('recipient')
+    amount = data.get('amount')
+    fee = data.get('fee')
+    
+    if not recipient or amount is None:
+        return jsonify({"code": 400, "error": "缺少参数"}), 400
+    
+    try:
+        amount = float(amount)
+        fee = float(fee) if fee is not None else None
+        if amount <= 0:
+            return jsonify({"code": 400, "error": "金额必须大于0"}), 400
+    except:
+        return jsonify({"code": 400, "error": "金额格式错误"}), 400
+    
+    result = wallet.send(recipient, amount, fee)
+    
+    if "error" in result:
+        return jsonify({"code": 400, "error": result["error"]}), 400
+    
+    return jsonify({
+        "code": 201, 
+        "success": True, 
+        "txid": result["txid"], 
+        "pending_block": result["pending_block"], 
+        "nonce": result["nonce"],
+        "fee": result["fee"],
+        "amount": result["amount"]
+    }), 201
+
+@app.route('/api/chain/stats', methods=['GET'])
+def api_chain_stats():
+    try:
+        resp = requests.get(f"http://{MAIN_NODE}/chain/stats", timeout=10)
+        return jsonify(resp.json())
+    except Exception as e:
+        return jsonify({"code": 500, "error": str(e)}), 500
+
+# ---------------- 主函数 ----------------
 def main():
-    """钱包主入口：启动"""
-    print("="*60)
-    print("🚀 区块链极简钱包 - 启动中...")
-    print(f"💡 地址格式：coinxxxxxxxxxxxxxxxx（固定20位，无下划线）")
-    print("💡 核心功能：查余额 | 发交易 | 查区块高度")
-    print("💡 操作方式：纯中文交互式，按数字选择即可")
-    print("="*60)
-
-    # 1. 检查主节点配置
-    if MAIN_NODE_URL == "http://你的云服务器公网IP:9753":
-        print("❌ 请先配置主节点地址！打开代码修改 MAIN_NODE_URL 为你的公网IP:9753")
-        input("按回车键退出...")
-        os._exit(1)
-    # 2. 验证主节点可达
-    check_main_node()
-    # 3. 加载/新建Coin地址钱包
-    load_wallet()
-    # 4. 启动后台心跳线程（保线用，不影响前台）
-    threading.Thread(target=auto_heartbeat, daemon=True).start()
-    # 5. 等待心跳连接成功
-    time.sleep(2)
-    print(f"\n✅ 钱包启动完成！当前连接状态：{'✅ 已连接' if is_connected else '❌ 连接中'}")
-    # 6. 进入主菜单
-    main_menu()
+    global wallet, local_port
+    
+    parser = argparse.ArgumentParser(description='Coin Wallet - XODE Wallet Client')
+    parser.add_argument('-p', '--port', default=8080, type=int, help='本地Web端口 (默认8080)')
+    args = parser.parse_args()
+    local_port = args.port
+    
+    wallet = CoinWallet()
+    
+    # 启动心跳线程
+    hb_thread = threading.Thread(target=wallet.heartbeat_loop, daemon=True)
+    hb_thread.start()
+    
+    print(f"""
+╔════════════════════════════════════════════════╗
+║              💰 Coin Wallet 已启动              ║
+╠════════════════════════════════════════════════╣
+║  🌐 Web界面: http://127.0.0.1:{local_port:<4}              ║
+║  💳 钱包地址: {wallet.coin_addr:<20}    ║
+║  🔗 主节点:  {MAIN_NODE:<25}    ║
+╠════════════════════════════════════════════════╣
+║  功能: 余额查询 | 转账汇款 | 自动参与区块奖励    ║
+║  安全: 私钥本地存储，不上传服务器               ║
+║  备份: 请妥善保管 {KEY_FILE:<16} 文件      ║
+╚════════════════════════════════════════════════╝
+    """)
+    
+    try:
+        import webbrowser
+        webbrowser.open(f'http://127.0.0.1:{local_port}')
+        print("🌐 已自动打开浏览器")
+    except:
+        pass
+    
+    app.run(host='0.0.0.0', port=local_port, debug=False, threaded=True, use_reloader=False)
 
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        print(f"\n❌ 钱包启动失败：{str(e)[:50]}")
-        input("按回车键退出...")
+    main()
