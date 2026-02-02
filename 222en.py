@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Coin Wallet - XODE Lightweight Wallet Client
-Features:
-  1. Auto-register with master node and maintain heartbeat (participate in block rewards)
-  2. Secure local private key storage with offline recovery support
-  3. Built-in Web interface for transfers and queries via browser
-  4. Auto-sync network fees from master node
-"""
 import hashlib
 import json
 import requests
@@ -563,4 +555,5 @@ def main():
     app.run(host='0.0.0.0', port=local_port, debug=False, threaded=True, use_reloader=False)
 
 if __name__ == '__main__':
+
     main()
